@@ -6,6 +6,9 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import {CrossChainCapyUSDeStakeRouter} from "./CrossChainCapyUSDeStakeRouter.sol";
+// import {ICapyUSDeOFTAdapter} from "./interface/ICapyUSDeOFTAdapter.sol";
+// import {ICapySUSDeOFTAdapter} from "./interface/ICapySUSDeOFTAdapter.sol";
 
 interface ICapyCore {
     function handleDistribution(
@@ -18,18 +21,30 @@ interface ICapyCore {
     ) external;
 }
 
-/// @title CapyTrustStrategy Contract
+/// @title CapyCrossChainTrustStrategy Contract
 /// @notice This contract implements a custom strategy for distributing funds to recipients
 /// @dev Inherits from BaseStrategy, OwnableUpgradeable, and ReentrancyGuard
-contract CapyTrustStrategy is
+contract CapyCrossChainTrustStrategy is
     BaseStrategy,
     OwnableUpgradeable,
     ReentrancyGuard
 {
     using SafeERC20 for IERC20;
 
+    // ====================================
+    // =========== Errors =================
+    // ====================================
+    error NOT_ENOUGH_FUNDS();
+    error CROSS_CHAIN_FUNDING_FAILED();
+    error INVALID_CALLER();
+
     ICapyCore internal immutable capyCore;
-    IERC20 internal immutable token;
+    IERC20 internal immutable usdeToken;
+    IERC20 internal immutable susdeToken;
+    CrossChainCapyUSDeStakeRouter public immutable crossChainStakeRouter;
+
+    // ICapyUSDeOFTAdapter public immutable usdeOFTAdapter;
+    // ICapySUSDeOFTAdapter public immutable sUsdeOFTAdapter;
 
     struct Recipient {
         address recipientAddress;
@@ -78,18 +93,33 @@ contract CapyTrustStrategy is
         uint256[] allocations,
         uint32 duration
     );
+    event CrossChainFundingInitiated(
+        uint256 indexed poolId,
+        uint256 amount,
+        uint32 dstChainId
+    );
+    event CrossChainFundingCompleted(
+        uint256 indexed poolId,
+        uint256 amount
+    );
 
     /// @notice Constructor to set the Allo contract, CapyCore, and token addresses
     /// @param _allo Address of the Allo contract
     /// @param _capyCore Address of the CapyCore contract
-    /// @param _token Address of the ERC20 token used for distributions
+    /// @param _usdeToken Address of the USDE token used for distributions
+    /// @param _susdeToken Address of the sUSDe token
+    /// @param _crossChainStakeRouter Address of the CrossChainCapyUSDeStakeRouter contract
     constructor(
         address _allo,
         address _capyCore,
-        address _token
+        address _usdeToken,
+        address _susdeToken,
+        address _crossChainStakeRouter
     ) BaseStrategy(_allo, "CapyTrustStrategy") {
         capyCore = ICapyCore(_capyCore);
-        token = IERC20(_token);
+        usdeToken = IERC20(_usdeToken);
+        susdeToken = IERC20(_susdeToken);
+        crossChainStakeRouter = CrossChainCapyUSDeStakeRouter(_crossChainStakeRouter);
     }
 
     /// @notice Initializes the strategy with factory specific parameters
@@ -199,6 +229,68 @@ contract CapyTrustStrategy is
         return recipientAddress;
     }
 
+    
+    /// @notice Step 1: Trust owner initiates funding through the stake router
+    function fundStrategyFromSourceChain(
+        uint256 amount,
+        uint32 dstChainId,
+        bytes calldata adapterParams
+    ) external payable onlyOwner nonReentrant {
+        if (amount == 0) revert NOT_ENOUGH_FUNDS();
+
+        // Transfer USDe from owner to strategy
+        usdeToken.safeTransferFrom(msg.sender, address(this), amount);
+        
+        // Approve USDe for stake router
+        usdeToken.approve(address(crossChainStakeRouter), amount);
+        
+        // Initiate cross-chain funding through router
+        try crossChainStakeRouter.fundAlloPoolCrossChain{value: msg.value}(
+            poolId,  // from BaseStrategy
+            amount,
+            dstChainId,
+            adapterParams
+        ) {
+            emit CrossChainFundingInitiated(poolId, amount, dstChainId);
+        } catch {
+            // Revert all state changes if cross-chain funding fails
+            usdeToken.approve(address(crossChainStakeRouter), 0);
+            revert CROSS_CHAIN_FUNDING_FAILED();
+        }
+    }
+
+    
+    /// @notice Step 5: Strategy receives sUSDe back and funds the pool
+    function onSUSDeReceived(
+        uint32 srcChainId,
+        bytes calldata srcAddress,
+        uint64 nonce,
+        bytes calldata data
+    ) external nonReentrant {
+        // Only the stake router should be calling this
+        if (msg.sender != address(crossChainStakeRouter)) revert INVALID_CALLER();
+        
+        (address strategy, uint256 _poolId, uint256 amount) = abi.decode(
+            data,
+            (address, uint256, uint256)
+        );
+        
+        // Validate the received data
+        require(strategy == address(this), "Invalid strategy");
+        require(_poolId == poolId, "Invalid pool");
+
+        // Fund the Allo pool using the received sUSDe
+        _fundPool(amount);
+
+        emit CrossChainFundingCompleted(poolId, amount);
+    }
+
+    // Required override from BaseStrategy
+    function _fundPool(uint256 _amount) internal {
+        // Implementation from BaseStrategy
+        allo.fundPool(poolId, _amount);
+    }
+
     /// @notice Allocates funds to recipients
     /// @dev Overrides BaseStrategy's _allocate function
     /// @param _data Encoded allocation data
@@ -278,12 +370,12 @@ contract CapyTrustStrategy is
 
         // TODO: maybe do a transfer approval instead
         // Transfer tokens to CapyCore
-        token.safeTransfer(address(capyCore), totalAllocation);
+        usdeToken.safeTransfer(address(capyCore), totalAllocation);
 
         // Call handleDistribution on CapyCore
         capyCore.handleDistribution(
             poolId,
-            token,
+            usdeToken,
             _recipientIds,
             allocations,
             duration,
@@ -370,7 +462,7 @@ contract CapyTrustStrategy is
     /// @notice Getter for the 'Token' contract.
     /// @return The Token contract
     function getToken() external view returns (IERC20) {
-        return token;
+        return usdeToken;
     }
 
     /// @notice Returns the total number of registered recipients
@@ -391,9 +483,9 @@ contract CapyTrustStrategy is
     /// @notice Withdraws any remaining tokens from the contract
     /// @dev Can only be called by the owner
     function withdrawRemainingTokens() external onlyPoolManager(msg.sender) {
-        uint256 remainingBalance = token.balanceOf(address(this));
+        uint256 remainingBalance = usdeToken.balanceOf(address(this));
         if (remainingBalance > 0) {
-            token.safeTransfer(owner(), remainingBalance);
+            usdeToken.safeTransfer(owner(), remainingBalance);
         }
     }
 
